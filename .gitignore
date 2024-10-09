@@ -1,3 +1,9 @@
+################################
+# Local build configuration
+################################
+
+local-env*
+.qmake.stash
 
 ################################
 # Operating System Files
@@ -78,7 +84,7 @@ var
 sdist
 develop-eggs
 .installed.cfg
-lib
+# lib
 lib64
 
 
@@ -119,6 +125,9 @@ nosetests.xml
 # Temporary Files
 ################################
 
+# utility
+_*
+
 # vim backup files
 *~
 
@@ -132,9 +141,14 @@ nosetests.xml
 *.not
 *eraseme*
 erase.*
+erase-*
 cache
 *.bak
 *.lkg
+*.working
+
+# asciidoctor
+*.html
 
 
 ################################
@@ -173,8 +187,10 @@ src/libcryptopp/adhoc.cpp
 src/libcryptopp/cryptest.exe
 src/libcryptopp/libcryptopp.a
 
-# argon2
-src/crypto/argon2/*.a
-src/crypto/argon2/test*
-src/crypto/argon2/src/*.o
-src/crypto/argon2/src/blake2/*.o
+# CMake
+Makefile
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+cmake_install.cmake
+cmake

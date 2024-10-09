@@ -14,7 +14,12 @@
 #undef printf
 #include <boost/asio.hpp>
 #include <boost/asio/ip/v6_only.hpp>
-#include <boost/bind.hpp>
+#if BOOST_VERSION >= 106500
+    #include <boost/bind/bind.hpp>
+#else
+    #include <boost/bind.hpp>
+#endif
+
 #include <boost/filesystem.hpp>
 #include <boost/foreach.hpp>
 #include <boost/iostreams/concepts.hpp>
@@ -31,6 +36,11 @@
 using namespace std;
 using namespace boost;
 using namespace boost::asio;
+
+#if BOOST_VERSION >= 106500
+using namespace boost::placeholders;
+#endif
+
 using namespace json_spirit;
 
 void ThreadRPCServer2(void* parg);
@@ -812,7 +822,7 @@ private:
 void ThreadRPCServer(void* parg)
 {
     // Make this thread recognisable as the RPC listener
-    RenameThread("bitcoin-rpclist");
+    RenameThread("stealth-rpclist");
 
     try
     {
@@ -959,13 +969,17 @@ void ThreadRPCServer2(void* parg)
     {
         context.set_options(ssl::context::no_sslv2);
 
-        filesystem::path pathCertFile(GetArg("-rpcsslcertificatechainfile",
-                                             "server.cert"));
+        boost::filesystem::path pathCertFile(
+            GetArg("-rpcsslcertificatechainfile", "server.cert"));
+#if BOOST_VERSION >= 107900
+        if (!pathCertFile.is_absolute())
+#else
         if (!pathCertFile.is_complete())
+#endif
         {
-            pathCertFile = filesystem::path(GetDataDir()) / pathCertFile;
+            pathCertFile = boost::filesystem::path(GetDataDir()) / pathCertFile;
         }
-        if (filesystem::exists(pathCertFile))
+        if (boost::filesystem::exists(pathCertFile))
         {
             context.use_certificate_chain_file(pathCertFile.string());
         }
@@ -975,12 +989,16 @@ void ThreadRPCServer2(void* parg)
                    pathCertFile.string().c_str());
         }
 
-        filesystem::path pathPKFile(GetArg("-rpcsslprivatekeyfile", "server.pem"));
+        boost::filesystem::path pathPKFile(GetArg("-rpcsslprivatekeyfile", "server.pem"));
+#if BOOST_VERSION >= 107900
+        if (!pathPKFile.is_absolute())
+#else
         if (!pathPKFile.is_complete())
+#endif
         {
-            pathPKFile = filesystem::path(GetDataDir()) / pathPKFile;
+            pathPKFile = boost::filesystem::path(GetDataDir()) / pathPKFile;
         }
-        if (filesystem::exists(pathPKFile))
+        if (boost::filesystem::exists(pathPKFile))
         {
             context.use_private_key_file(pathPKFile.string(), ssl::context::pem);
         }

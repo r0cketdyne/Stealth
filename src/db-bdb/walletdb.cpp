@@ -571,7 +571,7 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
 void ThreadFlushWalletDB(void* parg)
 {
     // Make this thread recognisable as the wallet flushing thread
-    RenameThread("bitcoin-wallet");
+    RenameThread("stealth-flushwa");
 
     const string& strFile = ((const string*)parg)[0];
     static bool fOneThread;
@@ -661,8 +661,14 @@ bool BackupWallet(const CWallet& wallet, const string& strDest)
                     pathDest /= wallet.strWalletFile;
 
                 try {
-#if BOOST_VERSION >= 104000
-                    filesystem::copy_file(pathSrc, pathDest, filesystem::copy_option::overwrite_if_exists);
+#if BOOST_VERSION >= 107400
+                    filesystem::copy_file(pathSrc,
+                                          pathDest,
+                                          filesystem::copy_options::overwrite_existing);
+#elif BOOST_VERSION >= 104000
+                    filesystem::copy_file(pathSrc,
+                                          pathDest,
+                                          filesystem::copy_option::overwrite_if_exists);
 #else
                     filesystem::copy_file(pathSrc, pathDest);
 #endif

@@ -23,6 +23,9 @@
 class CRequestTracker;
 class CNode;
 class CBlockIndex;
+
+extern const CAddress CADDR_NULL;
+
 extern int nBestHeight;
 
 extern int GetTargetSpacing(const int nHeight);
@@ -180,11 +183,14 @@ public:
     CAddress addr;
     std::string addrName;
     CService addrLocal;
+    // protocol version
     int nVersion;
-    // strSubVer is whatever byte array we read from the wire. However, this field is       intended 
-    // to be printed out, displayed to humans in various forms and so on. So we sanitize it and
-    // store the sanitized version in cleanSubVer. The original should be used when dealing with
-    // the network or wire types and the cleaned string used when displayed or logged.
+    // strSubVer is whatever byte array we read from the wire. However, this
+    // field is intended to be printed out, displayed to humans in
+    // various forms and so on. So we sanitize it and store the sanitized
+    // version in cleanSubVer. The original should be used when dealing with
+    // the network or wire types and the cleaned string used when displayed or
+    // logged.
     std::string strSubVer, cleanSubVer;
     bool fOneShot;
     bool fClient;
@@ -195,6 +201,8 @@ public:
     bool fDisconnect;
     int nOrphans;
     CSemaphoreGrant grantOutbound;
+private:
+    int nTimesVersionSent;
 protected:
     int nRefCount;
 
@@ -249,6 +257,7 @@ public:
         fSuccessfullyConnected = false;
         fDisconnect = false;
         nOrphans = 0;
+        nTimesVersionSent = 0;
         nRefCount = 0;
         nReleaseTime = 0;
         hashContinue = 0;
@@ -261,10 +270,11 @@ public:
         hashCheckpointKnown = 0;
         setInventoryKnown.max_size(SendBufferSize() / 1000);
 
-        // Be shy and don't send version until we hear
-        if (!fInbound)
-            printf("CNode(): pfrom-addr %s\n", addrName.c_str());
-            PushVersion();
+        printf("CNode(): %s-bound pfrom-addr %s\n",
+               fInbound ? "in" : "out",
+               addrName.c_str());
+
+        PushVersion();
     }
 
     ~CNode()
@@ -287,7 +297,7 @@ public:
         return std::max(nRefCount, 0) + (GetTime() < nReleaseTime ? 1 : 0);
     }
 
-    CNode* AddRef(int64_t nTimeout=0)
+    CNode* AddRef(int64_t nTimeout = 0)
     {
         if (nTimeout != 0)
             nReleaseTime = std::max(nReleaseTime, GetTime() + nTimeout);
@@ -313,8 +323,10 @@ public:
         // Known checking here is only to save space from duplicates.
         // SendMessages will filter it again for knowns that were added
         // after addresses were pushed.
-        if (addr.IsValid() && !setAddrKnown.count(addr))
+        if (addr.IsValid(nVersion) && !setAddrKnown.count(addr))
+        {
             vAddrToSend.push_back(addr);
+        }
     }
 
 
@@ -442,8 +454,8 @@ public:
         assert(nMessageStart - nHeaderStart >= CMessageHeader::CHECKSUM_OFFSET + sizeof(nChecksum));
         memcpy((char*)&vSend[nHeaderStart] + CMessageHeader::CHECKSUM_OFFSET, &nChecksum, sizeof(nChecksum));
 
-        if (fDebug) {
-            printf("(%d bytes)\n", nSize);
+        if (fDebugNet) {
+            printf("Message size: %d bytes\n", nSize);
         }
 
         nHeaderStart = -1;
@@ -697,16 +709,9 @@ public:
     static void ClearBanned(); // needed for unit testing
     static bool IsBanned(CNetAddr ip);
     bool Misbehaving(int howmuch); // 1 == a little, 100 == a lot
+    int GetMisbehavior() const;
     void copyStats(CNodeStats &stats);
 };
-
-
-
-
-
-
-
-
 
 
 inline void RelayInventory(const CInv& inv)

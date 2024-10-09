@@ -14,23 +14,16 @@ extern unsigned short onion_port;
 extern unsigned short p2p_port;
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-    char const* stealthcoin_tor_data_directory(
-    );
-
-    char const* stealthcoin_service_directory(
-    );
-
-    int check_interrupted(
-    );
-
-    void set_initialized(
-    );
-
-    void wait_initialized(
-    );
+    char const* coin_tor_data_directory();
+    char const* coin_service_directory();
+    int check_interrupted();
+    void set_initialized();
+    void wait_initialized();
+    void shutdown_tor();
 
 #ifdef __cplusplus
 }

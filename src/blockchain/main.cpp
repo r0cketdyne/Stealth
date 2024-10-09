@@ -166,7 +166,44 @@ int GetTargetSpacing(const int nHeight)
     return QP_TARGET_SPACING;
 }
 
+//////////////////////////////////////////////////////////////////////////////
+//
+// forks
+//
 
+// A fork is known if a nonsequential block has a known predecessor.
+//    Assuming quick resolution, some tolerance for forks is healthy.
+//    However, allowing a known fork to grow indefinitely poses
+//    problems for resource usage, consensus, and double spending.
+//    So it is necessary to ban nodes broadcasting alternative chains
+//    (long running forks) after they grow to an unreasonable length.
+// Returns true if a fork is too long.
+bool CheckForkTooLong(const CBlockIndex* const pindexFork,
+                      const CBlock* const pblock)
+{
+    bool fTooLong = false;
+    if (pindexFork)
+    {
+        // sanity check
+        if (pindexFork->nHeight > nBestHeight)
+        {
+            // this should never happen: fork is after best block
+           printf("TSNH: fork is higher than best:\n  fork: %s\n  best: %s\n",
+                  pindexFork->GetBlockHash().ToString().c_str(),
+                  hashBestChain.ToString().c_str());
+           throw runtime_error("TSNH: Fork is higher than best.");
+        }
+        int nForkLength = nBestHeight - pindexFork->nHeight;
+        if (nForkLength > chainParams.MAX_FORK_LENGTH)
+        {
+            printf("CheckForkLenghth(): fork too long (%d)\n  %s\n",
+                   nForkLength,
+                   pblock->GetHash().ToString().c_str());
+            fTooLong = true;
+        }
+    }
+    return fTooLong;
+}
 
 
 //////////////////////////////////////////////////////////////////////////////
@@ -290,35 +327,59 @@ void GetRegistrySnapshot(CTxDB &txdb, int nReplay, QPRegistry *pregistryTemp)
     }
 }
 
+// This function finds the first snapshot (which is necessarily
+//    in the main chain) earlier than pindexRewindTo.
+//    It then sets the registry state to this snapshot, then
+//    replays the registry to pindexReplayTo. It also sets
+//    pindexForkRet to the highest mainchain block between
+//    the snapshot and pindexRewindTo. It sets pindexCurrentRet
+//    to latest block replayed. Upon return, pindexCurrentRet
+//    should be the same as pindexReplayTo.
 bool RewindRegistry(CTxDB &txdb,
-                    CBlockIndex *pindexRewind,
                     QPRegistry *pregistry,
+                    CBlockIndex *pindexRewindTo,
+                    CBlockIndex *pindexReplayTo,
+                    const int nSnapshotType,
+                    CBlockIndex* &pindexForkRet,
                     CBlockIndex* &pindexCurrentRet)
 {
-    if (GetFork(pindexRewind->nHeight) < XST_FORKPURCHASE)
+    pindexForkRet = NULL;
+
+    if (GetFork(pindexRewindTo->nHeight) < XST_FORKPURCHASE)
     {
         pregistry->SetNull();
         return true;
     }
 
-    if (!pindexRewind->pprev)
+    if (!pindexRewindTo->pprev)
     {
         // this should never happen
         printf("RewindRegistry(): TSNH no prev block to %s\n"
                "    can't replay registry to rewind block\n",
-               pindexRewind->GetBlockHash().ToString().c_str());
+               pindexRewindTo->GetBlockHash().ToString().c_str());
         return false;
     }
 
     // this complicated loop finds the earliest snapshot that is a
-    // predecessor to pindexRewind
-    CBlockIndex *pindexSnap = pindexRewind;
+    // predecessor to pindexRewindTo
+    CBlockIndex *pindexSnap = pindexRewindTo;
     unsigned int nReadSnapCount = 0;
     while (true)
-    {
+     {
+        if (fDebugQPoS && (nReadSnapCount % 1000 == 0) && (nReadSnapCount > 0))
+        {
+                printf("RewindRegistry(): Read %u snaps.\n", nReadSnapCount);
+        }
         bool fSnapIsPrepurchase = false;
         while (pindexSnap->pprev)
         {
+            if (!pindexForkRet)
+            {
+                if (pindexSnap->IsInMainChain())
+                {
+                    pindexForkRet = pindexSnap;
+                }
+            }
             pindexSnap = pindexSnap->pprev;
             if (GetFork(pindexSnap->nHeight) < XST_FORKPURCHASE)
             {
@@ -326,7 +387,7 @@ bool RewindRegistry(CTxDB &txdb,
                 break;
             }
             if ((pindexSnap->nHeight % BLOCKS_PER_SNAPSHOT == 0) &&
-                pindexSnap->IsInMainChain())
+                pindexForkRet)
             {
                 break;
             }
@@ -352,7 +413,7 @@ bool RewindRegistry(CTxDB &txdb,
         {
             // 1. we need to actually replay the previous block
             // 2. ensure the registry matches the index we backtracked to
-            if ((pregistry->GetBlockHeight() != pindexRewind->nHeight) &&
+            if ((pregistry->GetBlockHeight() != pindexRewindTo->nHeight) &&
                 (pregistry->GetBlockHash() == pindexSnap->GetBlockHash()))
             {
                 break;
@@ -366,14 +427,14 @@ bool RewindRegistry(CTxDB &txdb,
            "    from %s (%d)\n    to %s (%d)\n",
            hashRegistry.ToString().c_str(),
            nHeightRegistry,
-           pindexRewind->GetBlockHash().ToString().c_str(),
-           pindexRewind->nHeight);
+           pindexReplayTo->GetBlockHash().ToString().c_str(),
+           pindexReplayTo->nHeight);
 
     pindexCurrentRet = mapBlockIndex[hashRegistry];
 
     vector<CBlockIndex*> vreplay;  // organized top to bottom
-    vreplay.push_back(pindexRewind);
-    CBlockIndex *pindexReplay = pindexRewind->pprev;
+    vreplay.push_back(pindexReplayTo);
+    CBlockIndex *pindexReplay = pindexReplayTo->pprev;
     while (pindexReplay->GetBlockHash() != hashRegistry)
     {
         if (GetFork(pindexReplay->nHeight) < XST_FORKPURCHASE)
@@ -405,7 +466,7 @@ bool RewindRegistry(CTxDB &txdb,
     {
         CBlockIndex *pindex = *rit;
         if (!pregistry->UpdateOnNewBlock(pindex,
-                                         QPRegistry::ALL_SNAPS,
+                                         nSnapshotType,
                                          fDebugQPoS))
         {
             // this should rarely happen, if at all
@@ -416,9 +477,9 @@ bool RewindRegistry(CTxDB &txdb,
         pindexCurrentRet = pindex;
     }
 
-    printf("RewindRegistry(): Done\n    from %s\n    to %s\n",
+    printf("RewindRegistry(): Replay done\n    from %s\n    to %s\n",
            hashRegistry.ToString().c_str(),
-           pindexRewind->GetBlockHash().ToString().c_str());
+           pindexReplayTo->GetBlockHash().ToString().c_str());
 
     return true;
 }
@@ -2101,9 +2162,9 @@ bool CTransaction::CheckFeework(Feework &feework,
                pblockindex->nHeight,
                pblockindex->phashBlock->ToString().c_str());
         printf("%s\n", feework.ToString("   ").c_str());
-        if (IsInitialBlockDownload())
+        if (pregistryMain->IsInReplayMode())
         {
-            // don't bump the DoS when syncing from the network
+            // don't bump the DoS when in replay
             return error("CheckFeework() : future block %d\n", feework.height);
         }
         else
@@ -3186,21 +3247,21 @@ bool IsInitialBlockDownload()
     int nBack = (GetFork(nBestHeight) < XST_FORKQPOS) ?
                    chainParams.LATEST_INITIAL_BLOCK_DOWNLOAD_TIME :
                    chainParams.LATEST_INITIAL_BLOCK_DOWNLOAD_TIME_QPOS;
-    if (pindexBest == NULL ||
-        nBestHeight < Checkpoints::GetTotalBlocksEstimate())
+    if (pindexBest == NULL)
     {
         return true;
     }
-    static int64_t nLastUpdate = pindexGenesisBlock->nTime;
-    static CBlockIndex* pindexLastBest;
-    if (pindexBest != pindexLastBest)
+    static int nLastUpdate = pindexBest->nTime;
+    static CBlockIndex* pindexLastBest = pindexBest;
+    if (pindexLastBest != pindexBest)
     {
+        nLastUpdate = pindexLastBest->nTime;
         pindexLastBest = pindexBest;
-        nLastUpdate = GetTime();
     }
     int nTime = GetTime();
-    return (((nTime - nLastUpdate) < 10) &&
-            (pindexBest->GetBlockTime() < (nTime - nBack)));
+    // covers future drift-type edge cases
+    return ((nTime - nLastUpdate) > nBack) ||
+           ((nTime - (int)pindexBest->nTime) > nBack);
 }
 
 void static InvalidChainFound(CBlockIndex* pindexNew)
@@ -4070,7 +4131,7 @@ bool static Reorganize(CTxDB& txdb,
 
         if (!block.DisconnectBlock(txdb, pindex))
         {
-            return error("Reorganize() : DisconnectBlock %s failed",
+            return error("Reorganize() : DisconnectBlock failed\n  %s",
                          pindex->GetBlockHash().ToString().c_str());
         }
 
@@ -4093,8 +4154,15 @@ bool static Reorganize(CTxDB& txdb,
     {
         return error("Reorganize() : creating temp registry failed");
     }
+    CBlockIndex *pindexFork;
     CBlockIndex *pindexCurrent;
-    RewindRegistry(txdb, pfork, pregistryTemp.get(), pindexCurrent);
+    RewindRegistry(txdb,
+                   pregistryTemp.get(),
+                   pfork,
+                   pfork,
+                   QPRegistry::ALL_SNAPS,
+                   pindexFork,
+                   pindexCurrent);
 
     // Connect longer branch from bottom up
     vector<CTransaction> vDelete;
@@ -4155,15 +4223,15 @@ bool static Reorganize(CTxDB& txdb,
 
     // Ensure that block previous to the first is itself properly connected
     // before connecting to this.
-    const CBlockIndex* pindexFirst = vConnect.empty() ? NULL : vConnect[0];
-    if (pindexFirst &&
-        pindexFirst->pprev &&
-        pindexFirst->pprev->pprev &&
-        pindexFirst->pprev->pprev->pnext != pindexFirst->pprev)
+    const CBlockIndex* pindexTop = vConnect.empty() ? NULL : vConnect[0];
+    if (pindexTop &&
+        pindexTop->pprev &&
+        pindexTop->pprev->pprev &&
+        pindexTop->pprev->pprev->pnext != pindexTop->pprev)
     {
         return error("SetBestChainInner(): "
                          "previous block is not properly connected\n  %s",
-                     pindexNew->pprev->pprev->phashBlock->ToString().c_str());
+                     pindexTop->pprev->pprev->phashBlock->ToString().c_str());
     }
 
     // Connect longer branch from bottom up
@@ -4392,9 +4460,17 @@ bool CBlock::SetBestChain(CTxDB& txdb,
         fReorganizedRet = true;
     }
 
-    // Update best block in wallet (so we can detect restored wallets)
+    // Update best block in wallet (so we can detect restored wallets).
+    // Initial block download (bootstrap) will add transactions
+    //    to the wallet. We update the wallet's best block every
+    //    10,000 blocks so that if the bootstrap terminates
+    //    unexpectedly, no more than 10,000 blocks will be
+    //    rescanned on next start.
     bool fIsInitialDownload = IsInitialBlockDownload();
-    if (!fIsInitialDownload)
+    if (!fIsInitialDownload ||
+        (pindexNewBest &&
+         (pindexNewBest->nHeight > 1) &&
+         (pindexNewBest->nHeight % 10000) == 0))
     {
         const CBlockLocator locator(pindexNewBest);
         ::SetBestChain(locator);
@@ -5043,6 +5119,7 @@ bool CBlock::CheckBlock(QPRegistry *pregistryTemp,
         {
             return error("CheckBlock(): registry update failed");
         }
+
         /***   end qPos checks   **********************************************/
     }
 
@@ -5181,6 +5258,63 @@ bool CBlock::AcceptBlock(QPRegistry *pregistryTemp,
         }
     }
 
+    // Even on bootstrap, check against a user-defined checkpoint
+    //    specified using "-usercheckpoint".
+    // This allows a user to sync an ad hoc bootstrap up to a block
+    //    known to be good by the user, without worrying that said
+    //    bootstrap may not be fully on the best chain.
+    // If the height of the new block is at least the height of the
+    //    user-checkpoint, and the user-checkpoint is not in the chain,
+    //    then the block will get rejected. This ensures that the chain
+    //    cannot extend past the user-checkpoint height unless it is the
+    //    chain in which the user-checkpoint is found.
+    static const string strUserCheckpoint = GetArg("-usercheckpoint", "");
+    static const bool fHaveUserCheckpoint = (strUserCheckpoint != "");
+    static const user_checkpoint userCheckNull = {"", false, "", 0, -1, -1};
+    static const user_checkpoint userCheck = (strUserCheckpoint == "") ?
+                                      userCheckNull :
+                                      ParseUserCheckpoint(strUserCheckpoint);
+    if (fHaveUserCheckpoint)
+    {
+        if (userCheck.fSuccess)
+        {
+            if (pindexPrev->nHeight < userCheck.expiration)
+            {
+                if (pindexPrev->nHeight >= userCheck.height)
+                {
+                    if (!Checkpoints::CheckSync(hash, pindexPrev, &userCheck))
+                    {
+                        return DoS(100,
+                                   error("AcceptBlock(): "
+                                         "rejected by -usercheckpoint"));
+                    }
+                }
+                else if ((pindexPrev->nHeight + 1) ==  userCheck.height)
+                {
+                    if (hash != userCheck.hash)
+                    {
+                        return DoS(100,
+                                   error("AcceptBlock(): new block "
+                                         "rejected by -usercheckpoint"));
+                    }
+                }
+            }
+            else
+            {
+                printf(("AcceptBlock(): WARNING: "
+                        "-usercheckpoint expired\n  \"%s\"\n"),
+                       strUserCheckpoint.c_str());
+            }
+        }
+        else
+        {
+            printf(("AcceptBlock(): WARNING: "
+                    "malformed -usercheckpoint\n  %s\n    \"%s\"\n"),
+                   userCheck.strErrMsg.c_str(),
+                   strUserCheckpoint.c_str());
+        }
+    }
+
     // Ensure that block height is serialized somwhere
     if (nFork >= XST_FORKQPOS)
     {
@@ -5203,7 +5337,7 @@ bool CBlock::AcceptBlock(QPRegistry *pregistryTemp,
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK, CLIENT_VERSION)))
         return error("AcceptBlock() : out of disk space");
     unsigned int nFile = -1;
-    unsigned int nBlockPos = 0;
+    long int nBlockPos = 0;
     if (!WriteToDisk(nFile, nBlockPos))
         return error("AcceptBlock() : WriteToDisk failed");
 
@@ -5304,18 +5438,30 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
         printf("ProcessBlock() : skipping genesis block\n   %s\n", hash.ToString().c_str());
         return false;
     }
+
     if (mapBlockIndex.count(hash))
     {
         // not an error, but return false because it was not processed
-        printf ("ProcessBlock() : already have block %d %s\n",
+        printf ("ProcessBlock() : already have block at %d\n  %s\n",
                 mapBlockIndex[hash]->nHeight,
                 hash.ToString().c_str());
-        return false;
+        if (mapBlockIndex[hash]->pprev == pindexBest)
+        {
+            // Hail Mary in the case that the block index
+            //    was not properly constructed before storage.
+            printf("    REPROCESSING\n");
+            // Erase it since it is probably incomplete.
+            mapBlockIndex.erase(hash);
+        }
+        else
+        {
+            return false;
+        }
     }
     if (mapOrphanBlocks.count(hash))
     {
         // not an error, but return false because it was not processed
-        printf("ProcessBlock() : already have block (orphan) %s\n",
+        printf("ProcessBlock() : already have block (orphan)\n  %s\n",
                hash.ToString().c_str());
         return false;
     }
@@ -5473,9 +5619,22 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
     * end of checkpoint specific code
     **************************************************************************/
 
-    // If don't already have its previous block, shunt it off to holding area until we get it
-    if (!mapBlockIndex.count(pblock->hashPrevBlock))
+    if (mapBlockIndex.count(pblock->hashPrevBlock))
     {
+        if (pfrom && IsInitialBlockDownload())
+        {
+            // Node has redeemed itself, remove an orphan from its count
+            pfrom->nOrphans = max((-2 * chainParams.GETBLOCKS_LIMIT),
+                                  (pfrom->nOrphans - 1));
+        }
+    }
+    else
+    {
+       /**********************************************************************
+        * It's an ORPHAN
+        **********************************************************************/
+        // We don't already have its previous block,
+        //    shunt it off to holding area until we get it
         printf("ProcessBlock: ORPHAN BLOCK, %s\n    prev=%s\n",
                hash.ToString().c_str(),
                pblock->hashPrevBlock.ToString().c_str());
@@ -5525,8 +5684,14 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
    /**************************************************************************
     * Not an ORPHAN
     **************************************************************************/
-
-    if (pregistryTemp->GetBlockHash() == pblock->hashPrevBlock)
+    CBlockIndex *pindexDeepestRewind = NULL;
+    // The pregistryTemp hash will be the genesis hash for blocks preceeding
+    //    the start of Junaeth (a.k.a qPoS). In this case, there is no reason
+    //    to attempt to rewind the registry to the previous block.
+    if ((pregistryTemp->GetBlockHash() == pblock->hashPrevBlock) ||
+        (pregistryTemp->GetBlockHash() == (fTestNet ?
+                          chainParams.hashGenesisBlockTestNet :
+                          chainParams.hashGenesisBlockMainNet)))
     {
         if (fDebugQPoS)
         {
@@ -5536,13 +5701,24 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
     }
     else
     {
-        printf("ProcessBlock() rewind registry to accept: %s\n",
+        printf(("ProcessBlock(): non-sequential block, "
+                "rewinding registry to accept:\n  %s\n"),
                hash.ToString().c_str());
-        CBlockIndex *pindexRewind = mapBlockIndex[pblock->hashPrevBlock];
+        printf("  temp: %s\n  prev: %s\n",
+               pregistryTemp->GetBlockHash().ToString().c_str(),
+               pblock->hashPrevBlock.ToString().c_str());
+        pindexDeepestRewind = mapBlockIndex[pblock->hashPrevBlock];
         CTxDB txdb("r");
+        CBlockIndex *pindexFork;
         CBlockIndex *pindexCurrent;
         pregistryTemp->SetNull();
-        if (!RewindRegistry(txdb, pindexRewind, pregistryTemp.get(), pindexCurrent))
+        if (!RewindRegistry(txdb,
+                            pregistryTemp.get(),
+                            pindexDeepestRewind,
+                            pindexDeepestRewind,
+                            QPRegistry::NO_SNAPS,
+                            pindexFork,
+                            pindexCurrent))
         {
             fProcessOK = false;
             return error("ProcessBlock() : Could not rewind registry to prev of %s",
@@ -5591,9 +5767,30 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
                 }
                 CBlockIndex *pindexRewind = mapBlockIndex[pblockOrphan->hashPrevBlock];
                 CTxDB txdb("r");
+                CBlockIndex *pindexFork;
                 CBlockIndex *pindexCurrent;
                 pregistryTemp->SetNull();
-                if (!RewindRegistry(txdb, pindexRewind, pregistryTemp.get(), pindexCurrent))
+                if (RewindRegistry(txdb,
+                                   pregistryTemp.get(),
+                                   pindexRewind,
+                                   pindexRewind,
+                                   QPRegistry::NO_SNAPS,
+                                   pindexFork,
+                                   pindexCurrent))
+                {
+                    if (pindexDeepestRewind)
+                    {
+                        if (pindexRewind->nHeight < pindexDeepestRewind->nHeight)
+                        {
+                            pindexDeepestRewind = pindexRewind;
+                        }
+                    }
+                    else
+                    {
+                        pindexDeepestRewind = pindexRewind;
+                    }
+                }
+                else
                 {
                     printf("ProcessBlock() : TSNH could not rewind registry\n");
                     continue;
@@ -5620,12 +5817,56 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock, bool& fProcessOK,
     // Only update main registry if on best chain
     if (hashBestChain == pregistryTemp->GetBlockHash())
     {
-        // Update main registry with pregistryTemp
-        bool fExitReplay = !pregistryMain->IsInReplayMode();
-        pregistryMain->Copy(pregistryTemp.get());
-        if (fExitReplay)
+        if (pindexDeepestRewind)
         {
-            pregistryMain->ExitReplayMode();
+            // We need to replay registry from deepest rewind to best
+            //    to ensure snapshots are consistent with main chain,
+            //    because no snapshots were created from the temp registries.
+            // Because rewinding is limited elswhere to MAX_FORK_LENGTH (5760),
+            //    this should not write too many snapshots, which are written
+            //    every BLOCKS_PER_SNAPSHOT (240) blocks even in cases of
+            //    long forks (5760/240 = 24 max snapshots).
+
+            // store a copy of the main registry in case this fails
+            bool fExitReplay = !pregistryMain->IsInReplayMode();
+            pregistryTemp->Copy(pregistryMain);
+            pregistryMain->SetNull();
+            CTxDB txdb("r");
+            CBlockIndex *pindexForkUnused;
+            CBlockIndex *pindexCurrent;
+            if (!RewindRegistry(txdb,
+                                pregistryMain,
+                                pindexDeepestRewind,
+                                pindexBest,
+                                QPRegistry::ALL_SNAPS,
+                                pindexForkUnused,
+                                pindexCurrent))
+            {
+                // restore the main registry
+                pregistryMain->Copy(pregistryTemp.get());
+                if (fExitReplay)
+                {
+                    pregistryMain->ExitReplayMode();
+                }
+                return error("ProcessBlock() : Couldn't rewind main registry:\n"
+                                "  rewind to %d\n    %s\n  replay to %d\n    %s\n",
+                             pindexDeepestRewind->nHeight,
+                             pindexDeepestRewind->GetBlockHash().ToString().c_str(),
+                             nBestHeight,
+                             hashBestChain.ToString().c_str());
+            }
+        }
+        else
+        {
+            // Update main registry with pregistryTemp
+            // No need to replay registry for snapshots
+            bool fExitReplay = !pregistryMain->IsInReplayMode();
+            pregistryMain->Copy(pregistryTemp.get());
+            if (fExitReplay)
+            {
+                pregistryMain->ExitReplayMode();
+            }
+            pregistryMain->CheckSynced();
         }
     }
 
@@ -5855,7 +6096,7 @@ static boost::filesystem::path BlockFilePath(unsigned int nFile)
 }
 
 
-FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode)
+FILE* OpenBlockFile(unsigned int nFile, long int nBlockPos, const char* pszMode)
 {
     if ((nFile < 1) || (nFile == (unsigned int) -1))
         return NULL;
@@ -5987,13 +6228,14 @@ bool LoadBlockIndex(bool fAllowNew)
 
         // Start new block file
         unsigned int nFile;
-        unsigned int nBlockPos;
+        long int nBlockPos;
         if (!block.WriteToDisk(nFile, nBlockPos))
             return error("LoadBlockIndex() : writing genesis block to disk failed");
-        if (!block.AddToBlockIndex(nFile, nBlockPos, hashGenesisBlock, pregistryMain))
+        if (!block.AddToBlockIndex(nFile, (unsigned int)nBlockPos, hashGenesisBlock, pregistryMain))
             return error("LoadBlockIndex() : genesis block not accepted");
 
         mapBlockLookup[0] = mapBlockIndex[block.GetHash()];
+
         // ppcoin: initialize synchronized checkpoint
         if (!Checkpoints::WriteSyncCheckpoint(fTestNet ?
                                        chainParams.hashGenesisBlockTestNet :
@@ -6103,33 +6345,43 @@ bool LoadExternalBlockFile(FILE* fileIn)
         LOCK(cs_main);
         try {
             CAutoFile blkdat(fileIn, SER_DISK, CLIENT_VERSION);
-            unsigned int nPos = 0;
-            while (nPos != (unsigned int)-1 && blkdat.good() && !fRequestShutdown)
+            long int nPos = 0;
+            while (nPos != (long int)-1 && blkdat.good() && !fRequestShutdown)
             {
                 unsigned char pchData[65536];
-                do {
+                do
+                {
                     fseek(blkdat, nPos, SEEK_SET);
                     int nRead = fread(pchData, 1, sizeof(pchData), blkdat);
                     if (nRead <= 8)
                     {
-                        nPos = (unsigned int)-1;
+                        nPos = (long int)-1;
                         break;
                     }
-                    void* nFind = memchr(pchData, pchMessageStart[0], nRead+1-sizeof(pchMessageStart));
+                    void* nFind = memchr(pchData,
+                                         pchMessageStart[0],
+                                         nRead + 1 - sizeof(pchMessageStart));
                     if (nFind)
                     {
-                        if (memcmp(nFind, pchMessageStart, sizeof(pchMessageStart))==0)
+                        if (memcmp(nFind,
+                                   pchMessageStart,
+                                   sizeof(pchMessageStart)) == 0)
                         {
-                            nPos += ((unsigned char*)nFind - pchData) + sizeof(pchMessageStart);
+                            nPos += ((unsigned char*)nFind - pchData) +
+                                    sizeof(pchMessageStart);
                             break;
                         }
                         nPos += ((unsigned char*)nFind - pchData) + 1;
                     }
                     else
+                    {
                         nPos += sizeof(pchData) - sizeof(pchMessageStart) + 1;
-                } while(!fRequestShutdown);
-                if (nPos == (unsigned int)-1)
+                    }
+                } while (!fRequestShutdown);
+                if (nPos == (long int)-1)
+                {
                     break;
+                }
                 fseek(blkdat, nPos, SEEK_SET);
                 unsigned int nSize;
                 blkdat >> nSize;
@@ -6361,8 +6613,16 @@ bool Rollback()
     {
         return error("Rollback() : creating temp registry failed");
     }
+
+    CBlockIndex *pindexFork;
     CBlockIndex *pindexCurrent;
-    if (!RewindRegistry(txdb, pindexRollback, pregistryTemp.get(), pindexCurrent))
+    if (!RewindRegistry(txdb,
+                        pregistryTemp.get(),
+                        pindexRollback,
+                        pindexRollback,
+                        QPRegistry::ALL_SNAPS,
+                        pindexFork,
+                        pindexCurrent))
     {
         // don't fail, just take best chain possible
         printf("Rollback(): could not rewind registry\n");
@@ -6377,11 +6637,8 @@ bool Rollback()
     }
 
     // Update best block in wallet (so we can detect restored wallets)
-    if (!IsInitialBlockDownload())
-    {
-        const CBlockLocator locator(pindexCurrent);
-        ::SetBestChain(locator);
-    }
+    const CBlockLocator locator(pindexCurrent);
+    ::SetBestChain(locator);
 
     // New best block
     pindexBest = pindexCurrent;
@@ -6406,16 +6663,90 @@ bool Rollback()
     return true;
 }
 
+// For tricky interactions between nodes that store address data
+//    as 16 bytes and those that store as 64 bytes.
+// It attempts to read a 64 byte address from a CDataStream.
+// If it can't, a 16 byte address is read (if possible).
+// In both cases, the data stream is set to the read position
+//    immediately following the 16 or 64 byte address.
+// The nVersion parameter is meant to come from context, such as
+//    a CNode version.
+// Returns 0 on fail, and the appropriate protocol version on success,
+//    setting the address to this protocol in the process.
+int ReadAddrOfUnknownSize(CDataStream& stream,
+                          CAddress& addrRet,
+                          const int nVersion)
+{
+    int nStreamVersion = stream.nVersion;
+    stream.nVersion = CADDR_IP16_VERSION;
+    unsigned int nIP16Size = stream.GetSerializeSize(addrRet);
+    if (stream.size() < nIP16Size)
+    {
+        // fail if stream isn't big enough for an IP16 address
+        stream.nVersion = nStreamVersion;
+        return 0;
+    }
+
+    int nResult = min(CADDR_IP16_VERSION, nVersion);
+
+    stream.nVersion = CADDR_IP64_VERSION;
+    unsigned int nIP64Size = stream.GetSerializeSize(addrRet);
+
+    // check version to avoid pointless deserialization
+    if ((nVersion >= CADDR_IP64_VERSION) && (stream.size() >= nIP64Size))
+    {
+        // if a stream is consumed, it's data is erased, so work with a copy
+        CDataStream streamTemp = stream;
+        CAddress addrTemp;
+        streamTemp >> addrTemp;
+        if (addrTemp.IsMarkedIP64())
+        {
+            nResult = max(CADDR_IP64_VERSION, nVersion);
+        }
+    }
+    stream.nVersion = nResult;
+    stream >> addrRet;
+    stream.nVersion = nStreamVersion;
+    return nResult;
+}
+
+
+// Messages:
+//   version
+//   verack
+//   addr
+//   inv
+//   getdata
+//   getblocks
+//   checkpoint
+//   getheaders
+//   tx
+//   block
+//   getaddr
+//   mempool
+//   checkorder
+//   reply
+//   ping
+//   alert
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
+    static int64_t nTimeLastPushGetBlocks = GetTime();
+
     if (fDebug) {
          printf("ProcessMessage(): pfrom-addr %s\n",
                 pfrom->addrName.c_str());
     }
     static map<CService, CPubKey> mapReuseKey;
     RandAddSeedPerfmon();
-    if (fDebug)
-        printf("received: %s (%" PRIszu " bytes)\n", strCommand.c_str(), vRecv.size());
+    if (fDebugNet && (strCommand != "block") &&
+        (strCommand != "getblocks") && (strCommand != "inv"))
+    {
+        string strHex = HexStr(vRecv.begin(), vRecv.end(), true);
+        printf("received: %s (%" PRIszu " bytes)\n%s\n",
+               strCommand.c_str(),
+               vRecv.size(),
+               ChunkHex(strHex, 16, "    ").c_str());
+    }
     if (mapArgs.count("-dropmessagestest") && GetRand(atoi(mapArgs["-dropmessagestest"])) == 0)
     {
         printf("dropmessagestest DROPPING RECV MESSAGE\n");
@@ -6444,33 +6775,102 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Each connection can only send one version message
         if (pfrom->nVersion != 0)
         {
+            if (fDebugNet)
+            {
+               printf("Partner %s already has version: %d\n",
+                      pfrom->addrName.c_str(),
+                      pfrom->nVersion);
+            }
             pfrom->Misbehaving(1);
-            return false;
+            if (pfrom->GetMisbehavior() > 1)
+            {
+                return false;
+            }
         }
 
         int64_t nTime;
+
         CAddress addrMe;
         CAddress addrFrom;
+
         uint64_t nNonce = 1;
         uint64_t verification_token = 0;
-        vRecv >> pfrom->nVersion >> pfrom->nServices >> nTime >> addrMe;
+
+        vRecv >> pfrom->nVersion >> pfrom->nServices >> nTime;
+
+        if (fDebugNet)
+        {
+            printf("   Partner version: %d\n", pfrom->nVersion);
+        }
+
+        int nProtocol = vRecv.nVersion;
+
+        // Be ready for future versions that serialize
+        //    addresses to 64 bytes exclusively.
+        if (pfrom->nVersion > CADDR_IP64_VERSION)
+        {
+            vRecv >> addrMe;
+        }
+        else
+        {
+            nProtocol = ReadAddrOfUnknownSize(vRecv,
+                                              addrMe,
+                                              pfrom->nVersion);
+            if (nProtocol == 0)
+            {
+                printf("partner %s sent malformed version message\n",
+                       pfrom->addrName.c_str());
+                pfrom->Misbehaving(25);
+                return false;
+            }
+            if (fDebugNet)
+            {
+               printf("   Me: %s\n%s\n",
+                      addrMe.ToString().c_str(),
+                      addrMe.GetHex(16, "       ").c_str());
+            }
+        }
+
         if (pfrom->nVersion < GetMinPeerProtoVersion(nBestHeight))
         {
             // disconnect from peers older than this proto version
             printf("partner %s using obsolete version %i; disconnecting\n",
-                                 pfrom->addrName.c_str(), pfrom->nVersion);
+                   pfrom->addrName.c_str(), pfrom->nVersion);
             pfrom->fDisconnect = true;
             return false;
         }
 
         if (!vRecv.empty())
-            vRecv >> addrFrom >> verification_token >> nNonce;
-        if (!vRecv.empty()) {
+        {
+            vRecv.nVersion = nProtocol;
+            vRecv >> addrFrom;
+            vRecv.nVersion = pfrom->nVersion;
+            if (fDebugNet)
+            {
+                printf("   From: %s\n%s\n",
+                       addrFrom.ToString().c_str(),
+                       addrFrom.GetHex(16, "       ").c_str());
+            }
+            vRecv >> verification_token >> nNonce;
+        }
+        if (!vRecv.empty())
+        {
             vRecv >> pfrom->strSubVer;
+            if (fDebugNet)
+            {
+                printf("  Sub-Version: \"%s\"\n", pfrom->strSubVer.c_str());
+            }
+
             pfrom->cleanSubVer = SanitizeString(pfrom->strSubVer);
         }
         if (!vRecv.empty())
+        {
             vRecv >> pfrom->nStartingHeight;
+            if (fDebugNet)
+            {
+                printf("  Starting Height: %d\n", pfrom->nStartingHeight);
+            }
+        }
 
         if (pfrom->fInbound && addrMe.IsRoutable())
         {
@@ -6481,29 +6881,32 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Disconnect if we connected to ourself
         if (nNonce == nLocalHostNonce && nNonce > 1)
         {
-            printf("connected to self at %s, disconnecting\n", pfrom->addrName.c_str());
+            printf("connected to self at %s, disconnecting\n",
+                   pfrom->addrName.c_str());
             pfrom->fDisconnect = true;
             return true;
         }
 
         // ppcoin: record my external IP reported by peer
         if (addrFrom.IsRoutable() && addrMe.IsRoutable())
+        {
             addrSeenByPeer = addrMe;
+        }
 
         // Be shy and don't send version until we hear
-        if (fDebug) {
+        if (fDebugNet) {
               printf("ProcessMessage(): %s\n", pfrom->addrName.c_str());
         }
-        if (pfrom->fInbound)
-            pfrom->PushVersion();
+
+        pfrom->PushVersion();
 
         pfrom->fClient = !(pfrom->nServices & NODE_NETWORK);
 
         AddTimeData(pfrom->addr, nTime);
 
         // Change version
-        pfrom->PushMessage("verack");
         pfrom->vSend.SetVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
+        pfrom->PushMessage("verack");
 
         if (!pfrom->fInbound)
         {
@@ -6512,7 +6915,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             {
                 CAddress addr = GetLocalAddress(&pfrom->addr);
                 if (addr.IsRoutable())
+                {
                     pfrom->PushAddress(addr);
+                }
             }
 
             // Get recent addresses
@@ -6545,13 +6950,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Ask the first connected node for block updates
         static int nAskedForBlocks = 0;
         if (!pfrom->fClient && !pfrom->fOneShot &&
-            (pfrom->nStartingHeight > (nBestHeight - 144)) &&
+            (pfrom->nStartingHeight > (nBestHeight - 720)) &&
             (pfrom->nVersion < NOBLKS_VERSION_START ||
              pfrom->nVersion >= NOBLKS_VERSION_END) &&
              (nAskedForBlocks < 1 || vNodes.size() <= 1))
         {
             nAskedForBlocks++;
             pfrom->PushGetBlocks(pindexBest, uint256(0));
+            nTimeLastPushGetBlocks = GetTime();
         }
 
         // Relay alerts
@@ -6579,28 +6985,56 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             Checkpoints::AskForPendingSyncCheckpoint(pfrom);
     }
 
-    else if (pfrom->nVersion == 0)
-    {
-        // Must have a version message before anything else
-        pfrom->Misbehaving(1);
-        return false;
-    }
-
 
     else if (strCommand == "verack")
     {
         pfrom->vRecv.SetVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
     }
 
+    else if (pfrom->nVersion == 0)
+    {
+        // Must have a version message before anything else
+        if (fDebugNet)
+        {
+           printf("Partner %s version out of order (%s)\n",
+                  pfrom->addrName.c_str(),
+                  strCommand.c_str());
+        }
+        pfrom->Misbehaving(1);
+    }
+
 
     else if (strCommand == "addr")
     {
         vector<CAddress> vAddr;
-        vRecv >> vAddr;
+
+        // Be ready for future versions that serialize
+        //    addresses to 64 bytes exclusively.
+        if (pfrom->nVersion > CADDR_IP64_VERSION)
+        {
+            vRecv >> vAddr;
+        }
+        else
+        {
+            CAddress addr;
+            while (vRecv.size() >= vRecv.GetSerializeSize(addr))
+            {
+                if (ReadAddrOfUnknownSize(vRecv, addr, pfrom->nVersion) == 0)
+                {
+                    printf("partner %s sent malformed addr message\n",
+                           pfrom->addrName.c_str());
+                    pfrom->Misbehaving(25);
+                    return false;
+                }
+                vAddr.push_back(addr);
+            }
+        }
 
         // Don't want addr from older versions unless seeding
         if (pfrom->nVersion < CADDR_TIME_VERSION && addrman.size() > 1000)
+        {
             return true;
+        }
         if (vAddr.size() > 1000)
         {
             pfrom->Misbehaving(20);
@@ -7091,7 +7525,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             if (nEvicted > 0)
                 printf("mapOrphan overflow, removed %u tx\n", nEvicted);
         }
-        if (tx.nDoS) pfrom->Misbehaving(tx.nDoS);
+        if (tx.nDoS)
+        {
+            pfrom->Misbehaving(tx.nDoS);
+        }
     }
 
     else if ((strCommand == "block") &&
@@ -7113,8 +7550,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         bool fProcessOK = false;
         bool fCheck = true;
 
+        CBlockIndex* pindexFork = NULL;
+
         if (block.hashPrevBlock == hashBestChain)
         {
+            pindexFork = pindexBest;
             if (fDebug)
             {
                 printf("Processing block fully: %s\n"
@@ -7140,6 +7580,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             CBlockIndex* pindex = pindexPrev;
             while (pindex && (pindex->nHeight > pindexBest->nHeight))
             {
+               if (!pindexFork)
+               {
+                   if (pindex->IsInMainChain())
+                   {
+                       pindexFork = pindex;
+                   }
+               }
                pindex = pindex->pprev;
             }
             if (pindex && (pindex == pindexBest))
@@ -7198,16 +7645,24 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
         if (fCheck)
         {
-            // Check nonsequential blocks as much as possible
-            // to mitigate certain types of spam attacks.
-            // A qPoS block can only fully validate if the registry is synced
-            // with the block's immediate predecessor.
-            // This full validation happens uppon connecting the block.
-            printf("Processing block just check:\n"
-                      "  This: %d  %s\n  Best: %d %s\n",
-                   block.nHeight, block.GetHash().ToString().c_str(),
-                   nBestHeight, hashBestChain.ToString().c_str());
-            ProcessBlock(pfrom, &block, fProcessOK, false, true);
+            // If block belongs to a fork, ensure it is not too long.
+            if (CheckForkTooLong(pindexFork, &block))
+            {
+                block.DoS(100, error("ProcessMessage() : fork too long"));
+            }
+            else
+            {
+                // Check nonsequential/orphan blocks as much as possible
+                // to mitigate certain types of spam attacks.
+                // A qPoS block can only fully validate if the registry is synced
+                // with the block's immediate predecessor.
+                // This full validation happens uppon connecting the block.
+                printf("Processing block just check:\n"
+                          "  This: %d  %s\n  Best: %d %s\n",
+                       block.nHeight, block.GetHash().ToString().c_str(),
+                       nBestHeight, hashBestChain.ToString().c_str());
+                ProcessBlock(pfrom, &block, fProcessOK, false, true);
+            }
         }
 
         // TODO: should this be recursive somehow?
@@ -7219,22 +7674,31 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         {
             if (Rollback())
             {
-                // going to reprocess block so reset its nDoS
-                block.nDoS = 0;
-                if ((GetFork(block.nHeight) < XST_FORKQPOS) ||
-                    (block.nHeight == (nBestHeight + 1)))
+                // If the block belongs to fork, this rollback may have
+                //    changed the length of the fork. Although the length
+                //    wouldn't change by much, the fairest way to continue
+                //    is simply to recheck the fork length.
+                if (CheckForkTooLong(pindexFork, &block))
                 {
-                    printf("Processing block fully (should rollback)\n");
-                    ProcessBlock(pfrom, &block, fProcessOK);
+                    block.DoS(100, error("ProcessMessage() : fork too long"));
                 }
                 else
                 {
-                    printf("Processing block just check (should rollback)\n");
-                    ProcessBlock(pfrom, &block, fProcessOK, false, true);
-                }
-                if (fProcessOK)
-                {
-                    mapAlreadyAskedFor.erase(inv);
+                    if ((GetFork(block.nHeight) < XST_FORKQPOS) ||
+                        (block.nHeight == (nBestHeight + 1)))
+                    {
+                        printf("Processing block fully (rolled back)\n");
+                        ProcessBlock(pfrom, &block, fProcessOK);
+                    }
+                    else
+                    {
+                        printf("Processing block just check (rolled back)\n");
+                        ProcessBlock(pfrom, &block, fProcessOK, false, true);
+                    }
+                    if (fProcessOK)
+                    {
+                        mapAlreadyAskedFor.erase(inv);
+                    }
                 }
             }
             else
@@ -7252,7 +7716,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         if (pfrom->nOrphans > 2 * chainParams.GETBLOCKS_LIMIT)
         {
-            printf("Node has exceeded max init download orphans.\n");
+            printf("Node has exceeded max net init download orphans.\n");
             pfrom->Misbehaving(100);
         }
     }
@@ -7387,12 +7851,29 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Ignore unknown commands for extensibility
     }
 
-
     // Update the last seen time for this node's address
     if (pfrom->fNetworkNode)
     {
-        if (strCommand == "version" || strCommand == "addr" || strCommand == "inv" || strCommand == "getdata" || strCommand == "ping")
+        if (strCommand == "version" || strCommand == "addr" ||
+            strCommand == "inv" || strCommand == "getdata" ||
+            strCommand == "ping")
+        {
             AddressCurrentlyConnected(pfrom->addr);
+        }
+        if (strCommand != "getblocks" && strCommand != "getheaders" &&
+            strCommand != "getdata" && strCommand != "block")
+        {
+            // Get blocks at a polite rate if it seems we are falling behind.
+            int64_t nTimeNow = GetTime();
+            if (((pfrom->nVersion < NOBLKS_VERSION_START) ||
+                 (pfrom->nVersion >= NOBLKS_VERSION_END))       &&
+                ((nTimeNow - pindexBest->nTime) > 720)          &&
+                ((nTimeNow - nTimeLastPushGetBlocks) > 60))
+            {
+                pfrom->PushGetBlocks(pindexBest, uint256(0));
+                nTimeLastPushGetBlocks = GetTime();
+            }
+        }
     }
 
 
@@ -7401,40 +7882,55 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
 bool ProcessMessages(CNode* pfrom)
 {
-    // if (fDebug) {
-    //       printf("ProcessMessages: %s\n",
-    //              pfrom->addr.ToString().c_str());
-    // }
     CDataStream& vRecv = pfrom->vRecv;
     if (vRecv.empty()) {
-        // if (fDebug)
-        // {
-        //    printf("ProcessMessages: %s [empty]\n",
-        //              pfrom->addr.ToString().c_str());
-        // }
+        if (fDebugNet)
+        {
+            // printf("ProcessMessages: %s [empty]\n",
+            //         pfrom->addr.ToString().c_str());
+            printf("|");
+        }
         return true;
     }
-    //
-    // Message format
-    //  (4) message start
-    //  (12) command
-    //  (4) size
-    //  (4) checksum
-    //  (x) data
-    //
+    else if (fDebugNet)
+    {
+        {
+            printf(("ProcessMessages():\n"
+                    "  addr: %s\n  addrName: %s\n  addrLocal: %s\n"),
+                   pfrom->addr.ToString().c_str(),
+                   pfrom->addrName.c_str(),
+                   pfrom->addrLocal.ToString().c_str());
+        }
+    }
 
+
+    ////////////////////////
+    // Message format     //
+    //  (4) message start //
+    //  (12) command      //
+    //  (4) size          //
+    //  (4) checksum      //
+    //  (x) data          //
+    ////////////////////////
     LOOP
     {
+        vRecv.nVersion = pfrom->nVersion;
+
         // Don't bother if send buffer is too full to respond anyway
         if (pfrom->vSend.size() >= SendBufferSize())
+        {
             break;
+        }
 
         // Scan for message start
-        CDataStream::iterator pstart = search(vRecv.begin(), vRecv.end(), BEGIN(pchMessageStart), END(pchMessageStart));
+        CDataStream::iterator pstart = search(vRecv.begin(),
+                                              vRecv.end(),
+                                              BEGIN(pchMessageStart),
+                                              END(pchMessageStart));
         int nHeaderSize = vRecv.GetSerializeSize(CMessageHeader());
         if (vRecv.end() - pstart < nHeaderSize)
         {
-            if ((int)vRecv.size() > nHeaderSize)
+            if ((int) vRecv.size() > nHeaderSize)
             {
                 printf("\n\nPROCESSMESSAGE MESSAGESTART NOT FOUND\n\n");
                 vRecv.erase(vRecv.begin(), vRecv.end() - nHeaderSize);
@@ -7442,7 +7938,10 @@ bool ProcessMessages(CNode* pfrom)
             break;
         }
         if (pstart - vRecv.begin() > 0)
-            printf("\n\nPROCESSMESSAGE SKIPPED %" PRIpdd " BYTES\n\n", pstart - vRecv.begin());
+        {
+            printf("\n\nPROCESSMESSAGE SKIPPED %" PRIpdd " BYTES\n\n",
+                   pstart - vRecv.begin());
+        }
         vRecv.erase(vRecv.begin(), pstart);
 
         // Read header
@@ -7451,26 +7950,33 @@ bool ProcessMessages(CNode* pfrom)
         vRecv >> hdr;
         if (!hdr.IsValid())
         {
-            printf("\n\nPROCESSMESSAGE: ERRORS IN HEADER %s\n\n\n", hdr.GetCommand().c_str());
+            printf("\n\nPROCESSMESSAGE: ERRORS IN HEADER %s\n\n\n",
+                   hdr.GetCommand().c_str());
             continue;
         }
         string strCommand = hdr.GetCommand();
-        if (fDebug) {
-              printf("ProcessMessages: %s [%s]\n",
-                         pfrom->addrName.c_str(), strCommand.c_str());
+        if (fDebugNet)
+        {
+            printf("ProcessMessages: %s [%s]\n",
+                   pfrom->addrName.c_str(),
+                   strCommand.c_str());
         }
 
         // Message size
         unsigned int nMessageSize = hdr.nMessageSize;
         if (nMessageSize > MAX_SIZE)
         {
-            printf("ProcessMessages(%s, %u bytes) : nMessageSize > MAX_SIZE\n", strCommand.c_str(), nMessageSize);
+            printf("ProcessMessages(%s, %u bytes) : nMessageSize > MAX_SIZE\n",
+                   strCommand.c_str(),
+                   nMessageSize);
             continue;
         }
         if (nMessageSize > vRecv.size())
         {
             // Rewind and wait for rest of message
-            vRecv.insert(vRecv.begin(), vHeaderSave.begin(), vHeaderSave.end());
+            vRecv.insert(vRecv.begin(),
+                         vHeaderSave.begin(),
+                         vHeaderSave.end());
             break;
         }
 
@@ -7480,13 +7986,20 @@ bool ProcessMessages(CNode* pfrom)
         memcpy(&nChecksum, &hash, sizeof(nChecksum));
         if (nChecksum != hdr.nChecksum)
         {
-            printf("ProcessMessages(%s, %u bytes) : CHECKSUM ERROR nChecksum=%08x hdr.nChecksum=%08x\n",
-               strCommand.c_str(), nMessageSize, nChecksum, hdr.nChecksum);
+            printf("ProcessMessages(%s, %u bytes) : CHECKSUM ERROR "
+                   "nChecksum=%08x hdr.nChecksum=%08x\n",
+                   strCommand.c_str(),
+                   nMessageSize,
+                   nChecksum,
+                   hdr.nChecksum);
             continue;
         }
 
         // Copy message to its own buffer
-        CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
+        CDataStream vMsg(vRecv.begin(),
+                         vRecv.begin() + nMessageSize,
+                         vRecv.nType,
+                         vRecv.nVersion);
 
         try
         {
@@ -7494,8 +8007,11 @@ bool ProcessMessages(CNode* pfrom)
         }
         catch (ios_base::failure& e)
         {
-            // can only be end of data, should cause failure in processing below
-            printf("ProcessMessages() : Exception '%s' caught, caused by unexpectedly reaching end of buffer\n", e.what());
+            // can only be end of data, should cause failure in processing
+            // below
+            printf("ProcessMessages() : Exception '%s' caught, caused by "
+                   "unexpectedly reaching end of buffer\n",
+                   e.what());
         }
 
         // Process message
@@ -7507,33 +8023,56 @@ bool ProcessMessages(CNode* pfrom)
                 fRet = ProcessMessage(pfrom, strCommand, vMsg);
             }
             if (fShutdown)
+            {
                 return true;
+            }
         }
         catch (ios_base::failure& e)
         {
             if (strstr(e.what(), "end of data"))
             {
                 // Allow exceptions from under-length message on vRecv
-                printf("ProcessMessages(%s, %u bytes) : Exception '%s' caught, normally caused by a message being shorter than its stated length\n", strCommand.c_str(), nMessageSize, e.what());
+                printf("ProcessMessages(%s, %u bytes) : Exception '%s' "
+                       "caught, normally caused by a message being shorter "
+                       "than its inferred length\n",
+                       strCommand.c_str(),
+                       nMessageSize,
+                       e.what());
             }
             else if (strstr(e.what(), "size too large"))
             {
                 // Allow exceptions from over-long size
-                printf("ProcessMessages(%s, %u bytes) : Exception '%s' caught\n", strCommand.c_str(), nMessageSize, e.what());
+                printf(
+                    "ProcessMessages(%s, %u bytes) : Exception '%s' caught\n",
+                    strCommand.c_str(),
+                    nMessageSize,
+                    e.what());
             }
             else
             {
                 PrintExceptionContinue(&e, "ProcessMessages()");
             }
+            pfrom->Misbehaving(33);
         }
-        catch (exception& e) {
+        catch (exception& e)
+        {
             PrintExceptionContinue(&e, "ProcessMessages()");
-        } catch (...) {
+        }
+        catch (...)
+        {
             PrintExceptionContinue(NULL, "ProcessMessages()");
         }
 
         if (!fRet)
-            printf("ProcessMessage(%s, %u bytes) FAILED\n", strCommand.c_str(), nMessageSize);
+        {
+            printf("ProcessMessage(command: \"%s\", %u bytes) FAILED\n",
+                   strCommand.c_str(),
+                   nMessageSize);
+            printf(("  addr: %s\n  addrName: %s\n  addrLocal: %s\n"),
+                   pfrom->addr.ToString().c_str(),
+                   pfrom->addrName.c_str(),
+                   pfrom->addrLocal.ToString().c_str());
+        }
     }
 
     vRecv.Compact();
@@ -7550,6 +8089,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         {
             return true;
         }
+
+        pto->vSend.nVersion = pto->nVersion;
 
         // Keep-alive ping. We send a nonce of zero because we don't use it anywhere
         // right now.
@@ -7595,7 +8136,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         {
             vector<CAddress> vAddr;
             vAddr.reserve(pto->vAddrToSend.size());
-            BOOST_FOREACH(const CAddress& addr, pto->vAddrToSend)
+            BOOST_FOREACH (const CAddress& addr, pto->vAddrToSend)
             {
                 // returns true if wasn't already contained in the set
                 if (pto->setAddrKnown.insert(addr).second)
@@ -7611,7 +8152,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             }
             pto->vAddrToSend.clear();
             if (!vAddr.empty())
+            {
                 pto->PushMessage("addr", vAddr);
+            }
         }
 
 
@@ -7702,7 +8245,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
 
             if (AlreadyHave(txdb, inv))
             {
-                if (fDebug)
+                if (fDebugNet)
                 {
                     printf("already have %s\n",
                            inv.ToString().c_str());
@@ -8567,13 +9110,13 @@ void StealthMinter(CWallet *pwallet, ProofTypes fTypeOfProof)
     {
         case PROOFTYPE_POW:
             fProofOfWork = true;
-            RenameThread("stealth-minter-pow");
+            RenameThread("stealth-pow");
             printf("CPUMinter started for proof-of-work\n");
             break;
         case PROOFTYPE_POS:
             nSleepInterval = 60000;
             fProofOfStake = true;
-            RenameThread("stealth-minter-pos");
+            RenameThread("stealth-pos");
             printf("CPUMinter started for proof-of-stake\n");
             break;
         default:
@@ -8601,9 +9144,7 @@ void StealthMinter(CWallet *pwallet, ProofTypes fTypeOfProof)
         }
 
         // rollbacks mean qPoS can keep producing even with 0 connections
-        while (vNodes.empty() ||
-               IsInitialBlockDownload() ||
-               pwallet->IsLocked())
+        while (vNodes.empty() || pwallet->IsLocked())
         {
             nLastCoinStakeSearchInterval = 0;
             MilliSleep(1000);

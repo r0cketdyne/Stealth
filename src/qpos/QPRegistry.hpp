@@ -13,7 +13,9 @@
 #include "meta.hpp"
 #include "nfts.hpp"
 
-#include <boost/random.hpp>
+#include <boost/random/uniform_int.hpp>
+#include <boost/random/mersenne_twister.hpp>
+#include <boost/random/variate_generator.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/lockable_adapter.hpp>
 
@@ -72,7 +74,7 @@ private:
     unsigned int GetIDForPrevSlot() const;
     bool GetPrevRecentBlocksMissedMax(unsigned int nID,
                                       uint32_t &nMaxRet) const;
-    void GetBalances(const std::map<CPubKey, int64_t> *pRet) const;
+    const std::map<CPubKey, int64_t>* GetBalances() const;
     QPStaker* GetStakerForID(unsigned int nID);
     QPStaker* GetStakerForAlias(const std::string &sAlias);
     bool StakerProducedBlock(const CBlockIndex *pindex,
